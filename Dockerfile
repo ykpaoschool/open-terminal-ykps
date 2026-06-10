@@ -19,12 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Extra pip packages ──────────────────────────────────────────────
 RUN pip install --no-cache-dir \
     defusedxml \
-    Pillow \
-    true
+    Pillow
 
 # ── Extra npm packages (global) ─────────────────────────────────────
 RUN npm install -g \
-    pptxgenjs \
-    true
+    pptxgenjs
 
 USER user
