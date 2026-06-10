@@ -12,17 +12,17 @@ USER root
 
 # ── Extra apt packages ──────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # <add your apt packages here> \
+    libreoffice-core-nogui \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Extra pip packages ──────────────────────────────────────────────
 RUN pip install --no-cache-dir \
-    # <add your pip packages here> \
-    true
+    defusedxml \
+    Pillow
 
 # ── Extra npm packages (global) ─────────────────────────────────────
-# RUN npm install -g \
-#     # <add your npm packages here> \
-#     true
+RUN npm install -g \
+    pptxgenjs
 
 USER user
