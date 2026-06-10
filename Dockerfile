@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── Extra pip packages ──────────────────────────────────────────────
 RUN pip install --no-cache-dir \
-    # <add your pip packages here> \
+    defusedxml \
+    Pillow \
     true
 
 # ── Extra npm packages (global) ─────────────────────────────────────
