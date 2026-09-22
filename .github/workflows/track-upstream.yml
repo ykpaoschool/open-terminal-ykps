@@ -1,0 +1,130 @@
+name: Track Upstream Open Terminal
+
+# Polls open-webui/open-terminal for new stable releases and opens a PR bumping
+# UPSTREAM_VERSION. Merging that PR triggers ci-build.yml, which publishes the
+# image tagged with the new version.
+
+on:
+  schedule:
+    # Daily at 06:17 UTC (off-peak minute)
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: open-webui/open-terminal
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read current pinned version
+        id: current
+        run: echo "version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch latest upstream release
+        id: latest
+        run: |
+          # /releases/latest excludes drafts and prereleases.
+          tag=$(curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+            | jq -r .tag_name)
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "Failed to fetch latest upstream release" >&2
+            exit 1
+          fi
+          # Upstream release tags carry a leading "v" (v0.13.0) but its image
+          # tags do not (0.13.0). UPSTREAM_VERSION stores the image tag form so
+          # it drops straight into the Dockerfile FROM line.
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare versions
+        id: cmp
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+
+          def tup(v):
+              out = []
+              for part in v.lstrip("v").split("."):
+                  digits = ""
+                  for ch in part:
+                      if not ch.isdigit():
+                          break
+                      digits += ch
+                  out.append(int(digits) if digits else 0)
+              return tuple(out)
+
+          current = tup(os.environ["CURRENT"])
+          latest = tup(os.environ["LATEST"])
+          print(f"newer={'true' if latest > current else 'false'}")
+          PY
+
+      - name: Verify the upstream image tag is published
+        if: steps.cmp.outputs.newer == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          # A release can be tagged a little before its image finishes pushing.
+          # Retry before giving up, so a normal race self-heals silently while a
+          # real breakage (e.g. upstream renaming its tags) still fails loudly.
+          for attempt in $(seq 1 6); do
+            token=$(curl -fsSL \
+              "https://ghcr.io/token?scope=repository:${UPSTREAM_REPO}:pull&service=ghcr.io" \
+              | jq -r .token)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://ghcr.io/v2/${UPSTREAM_REPO}/manifests/${VERSION}")
+            if [ "$code" = "200" ]; then
+              echo "ghcr.io/${UPSTREAM_REPO}:${VERSION} is published"
+              exit 0
+            fi
+            echo "attempt ${attempt}/6: ghcr.io/${UPSTREAM_REPO}:${VERSION} -> HTTP ${code}"
+            [ "$attempt" -lt 6 ] && sleep 30
+          done
+          echo "::error::ghcr.io/${UPSTREAM_REPO}:${VERSION} is still unpublished after 6 attempts; not opening a PR."
+          exit 1
+
+      - name: Bump UPSTREAM_VERSION and the Dockerfile arg default
+        if: steps.cmp.outputs.newer == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          printf '%s\n' "$VERSION" > UPSTREAM_VERSION
+          sed -i "s|^ARG OPEN_TERMINAL_VERSION=.*|ARG OPEN_TERMINAL_VERSION=${VERSION}|" Dockerfile
+          # Fail loudly if the Dockerfile line ever moves out from under the sed.
+          grep -qx "ARG OPEN_TERMINAL_VERSION=${VERSION}" Dockerfile
+
+      - name: Open pull request
+        if: steps.cmp.outputs.newer == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: |
+            chore(deps): bump upstream open-terminal to ${{ steps.latest.outputs.version }}
+          branch: bump/upstream-${{ steps.latest.outputs.version }}
+          title: |
+            chore(deps): bump upstream open-terminal to ${{ steps.latest.outputs.version }}
+          body: |
+            Upstream Open Terminal released a new stable version.
+
+            - Current: `${{ steps.current.outputs.version }}`
+            - Latest:  `${{ steps.latest.outputs.version }}`
+            - Release notes: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.latest.outputs.release_tag }}
+
+            Merging this PR will trigger `ci-build.yml`, which builds and publishes the image tagged with this version (and moves `latest`).
+          labels: dependencies
+          delete-branch: true

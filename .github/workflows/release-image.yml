@@ -1,0 +1,75 @@
+name: Build and Publish Custom Open Terminal Image
+
+# Escape-hatch workflow for one-off builds (e.g. rebuilding an older version
+# for rollback testing, or building upstream `main` for verification).
+# Day-to-day upgrades are handled automatically by track-upstream.yml + ci-build.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      open_terminal_version:
+        description: 'Upstream open-terminal image tag (e.g. 0.13.0, main). Defaults to UPSTREAM_VERSION when blank.'
+        required: false
+        default: ''
+      tag_latest:
+        description: 'Also tag the build as `latest` (use with care; can clobber the stable latest).'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.open_terminal_version }}
+        run: |
+          if [ -z "$INPUT_VERSION" ]; then
+            version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')
+          else
+            version="$INPUT_VERSION"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=sha
+            type=raw,value=latest,enable=${{ inputs.tag_latest }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            OPEN_TERMINAL_VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
