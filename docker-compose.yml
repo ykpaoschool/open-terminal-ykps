@@ -1,5 +1,9 @@
 services:
   open-terminal:
+    # The upstream base version comes from the Dockerfile's
+    # OPEN_TERMINAL_VERSION arg default (kept in sync with UPSTREAM_VERSION).
+    # Override for a one-off build:
+    #   docker compose build --build-arg OPEN_TERMINAL_VERSION=0.12.5
     build: .
     image: open-terminal-ykps
     container_name: open-terminal

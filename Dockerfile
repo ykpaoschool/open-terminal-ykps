@@ -2,11 +2,17 @@
 # Based on the upstream full image which already includes:
 # Python, Node.js, Docker CLI, gcc, ffmpeg, data science libs, etc.
 #
-# Pin to a specific tag for reproducible builds:
-#   FROM ghcr.io/open-webui/open-terminal:0.11.34
-# Use "latest" to always track the newest upstream release.
+# The upstream base version is pinned by OPEN_TERMINAL_VERSION, which mirrors
+# the repo's source of truth, the UPSTREAM_VERSION file. CI always passes it in
+# explicitly; the default below is kept in sync by track-upstream.yml so that a
+# plain `docker compose build` reproduces the same image.
+#
+# Note: upstream tags its images *without* a leading "v" (0.13.0), even though
+# its GitHub release tags carry one (v0.13.0). UPSTREAM_VERSION uses the image
+# tag form, so it drops straight into the FROM line below.
 
-FROM ghcr.io/open-webui/open-terminal:latest
+ARG OPEN_TERMINAL_VERSION=0.13.0
+FROM ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
 
 USER root
 
