@@ -11,7 +11,7 @@
 # its GitHub release tags carry one (v0.13.0). UPSTREAM_VERSION uses the image
 # tag form, so it drops straight into the FROM line below.
 
-ARG OPEN_TERMINAL_VERSION=0.13.0
+ARG OPEN_TERMINAL_VERSION=0.14.0
 FROM ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
 
 USER root
