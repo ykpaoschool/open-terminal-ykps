@@ -13,7 +13,7 @@
 
 
 =======
-ARG OPEN_TERMINAL_VERSION=0.14.2
+ARG OPEN_TERMINAL_VERSION=0.14.4
 
 FROM ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
 
