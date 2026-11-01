@@ -3,12 +3,41 @@ name: Track Upstream Open Terminal
 # Polls open-webui/open-terminal for new stable releases and opens a PR bumping
 # UPSTREAM_VERSION. Merging that PR triggers ci-build.yml, which publishes the
 # image tagged with the new version.
+#
+# Why this workflow lists releases instead of asking for `releases/latest`:
+#   Upstream can publish more than one stable release between two daily polls.
+#   `releases/latest` only ever returns the newest one, so versions published in
+#   between were never seen — v0.14.3 and v0.14.4 landed eleven minutes apart on
+#   2026-10-23 and v0.14.3 was skipped. We read the release list, drop
+#   drafts/prereleases, sort by semver and bump to the OLDEST missing version, so
+#   every gap is eventually picked up and built.
+#
+# Why one version per run (serial catch-up) and not one PR per gap:
+#   Every bump edits the same single-line `UPSTREAM_VERSION` and the same
+#   Dockerfile line, so parallel bump PRs conflict with each other and the later
+#   ones go stale. Bumping the oldest gap first, then letting the next daily run
+#   find the next gap, keeps exactly one open PR at a time and moves `latest`
+#   strictly forward.
+#
+# Do NOT "fix" a gap by pointing UPSTREAM_VERSION at an older tag:
+#   `latest` is written only by ci-build.yml from UPSTREAM_VERSION, so moving it
+#   backwards would make `latest` regress. Backfilling an already-skipped version
+#   is a manual `release-image.yml` dispatch, never an edit of this file.
 
 on:
   schedule:
     # Daily at 06:17 UTC (off-peak minute)
     - cron: '17 6 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report the gap list; do not modify files or open a PR.'
+        type: boolean
+        default: true
+      simulate_current_version:
+        description: 'Dry run only: pretend UPSTREAM_VERSION is this tag (e.g. 0.13.0) to exercise the gap logic.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -16,6 +45,10 @@ permissions:
 
 env:
   UPSTREAM_REPO: open-webui/open-terminal
+
+concurrency:
+  group: track-upstream
+  cancel-in-progress: false
 
 jobs:
   check-and-bump:
@@ -25,73 +58,180 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve run mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+          SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
+        run: |
+          # Scheduled runs always act for real; manual dispatches default to dry run.
+          dry="true"
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$DRY_RUN_INPUT" = "false" ]; then
+            dry="false"
+          fi
+          if [ -n "$SIMULATE_INPUT" ] && [ "$dry" != "true" ]; then
+            echo "::error::simulate_current_version is only allowed with dry_run=true"
+            exit 1
+          fi
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
+
       - name: Read current pinned version
         id: current
-        run: echo "version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve newest upstream stable release
-        id: latest
         env:
-          CURRENT: ${{ steps.current.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
         run: |
-          # /releases/latest only ever returns a single release, so when upstream
-          # ships twice between two polls (v0.14.3 and v0.14.4 came out eleven
-          # minutes apart) the earlier one is never seen. Read the whole list
-          # instead and pick the highest stable version, so a skipped release at
-          # least shows up in the logs and in the PR body.
-          #
-          # Picking the highest version - rather than the most recently published
-          # release - also keeps a late backport (e.g. v0.13.1 published after
-          # v0.14.7) from masking the fact that we are already further ahead.
-          curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100" \
-            -o /tmp/releases.json
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, sys
+          if [ -n "$SIMULATE_INPUT" ]; then
+            version="$SIMULATE_INPUT"
+            echo "::notice::Simulating current UPSTREAM_VERSION as $version"
+          else
+            version=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::UPSTREAM_VERSION is empty"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-          def tup(v):
-              out = []
-              for part in v.lstrip("v").split("."):
-                  digits = ""
-                  for ch in part:
-                      if not ch.isdigit():
-                          break
-                      digits += ch
-                  out.append(int(digits) if digits else 0)
-              return tuple(out)
+      - name: Fetch recent upstream releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES_JSON: ${{ runner.temp }}/releases.json
+        run: |
+          # One page of 100 is far more than the number of releases upstream can
+          # publish between two daily polls; the page is only a window, not a
+          # historical record.
+          gh api "repos/${UPSTREAM_REPO}/releases?per_page=100" > "$RELEASES_JSON"
+          jq -e 'type == "array" and length > 0' "$RELEASES_JSON" > /dev/null
+          echo "Fetched $(jq length "$RELEASES_JSON") releases"
 
-          with open("/tmp/releases.json") as fh:
+      - name: Compute missing stable versions
+        id: gaps
+        env:
+          CUR_VERSION: ${{ steps.current.outputs.version }}
+          RELEASES_JSON: ${{ runner.temp }}/releases.json
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          # Tags like v0.14.3 only. This rejects branches (main, dev) and
+          # pre-release/build suffixes, so no non-stable tag can ever be built.
+          SEMVER = re.compile(r"v?(\d+(?:\.\d+)*)")
+
+          def parse(tag):
+              m = SEMVER.fullmatch(tag.strip())
+              if not m:
+                  return None
+              return tuple(int(p) for p in m.group(1).split("."))
+
+          def fmt(key):
+              # UPSTREAM_VERSION and the Dockerfile arg store the *image* tag
+              # form, which upstream publishes without a leading "v" (0.14.3),
+              # even though its release tags carry one (v0.14.3).
+              return ".".join(str(p) for p in key)
+
+          cur_raw = os.environ["CUR_VERSION"].strip()
+          cur = parse(cur_raw)
+          if cur is None:
+              sys.exit(f"Invalid current version: {cur_raw!r}")
+
+          with open(os.environ["RELEASES_JSON"], encoding="utf-8") as fh:
               releases = json.load(fh)
-          if not isinstance(releases, list):
-              sys.exit("Unexpected GitHub API response while listing releases")
 
-          # Drafts and prereleases are excluded, as /releases/latest did before.
-          by_version = {}
+          stable = {}
+          skipped = []
           for rel in releases:
-              if rel.get("draft") or rel.get("prerelease"):
+              tag = (rel.get("tag_name") or "").strip()
+              if rel.get("draft"):
+                  skipped.append(f"{tag} (draft)")
                   continue
-              by_version.setdefault(tup(rel["tag_name"]), rel["tag_name"])
+              if rel.get("prerelease"):
+                  skipped.append(f"{tag} (prerelease)")
+                  continue
+              key = parse(tag)
+              if key is None:
+                  skipped.append(f"{tag} (not semver)")
+                  continue
+              # The list is newest-first, so keep the first occurrence.
+              stable.setdefault(key, tag)
 
-          current = tup(os.environ["CURRENT"])
-          newer = sorted(v for v in by_version if v > current)
-          print(f"newer={'true' if newer else 'false'}")
-          if newer:
-              # Upstream release tags carry a leading "v" (v0.13.0) but its image
-              # tags do not (0.13.0). UPSTREAM_VERSION stores the image tag form
-              # so it drops straight into the Dockerfile FROM line.
-              tag = by_version[newer[-1]]
-              print(f"release_tag={tag}")
-              print(f"version={tag.lstrip('v')}")
-          print("skipped=" + ",".join(by_version[v] for v in newer[:-1]))
+          missing_keys = sorted(k for k in stable if k > cur)
+          missing = [stable[k] for k in missing_keys]
+          next_key = missing_keys[0] if missing_keys else None
+          newest = max(stable) if stable else None
+
+          cur_seen = cur in stable
+          truncated = len(releases) >= 100
+
+          lines = [
+              "### Upstream release check",
+              "",
+              "| | |",
+              "|---|---|",
+              f"| Current `UPSTREAM_VERSION` | `{cur_raw}`{' (simulated)' if os.environ.get('SIMULATE_INPUT') else ''} |",
+              f"| Stable releases in window | {len(stable)} |",
+              f"| Newest stable release | `{fmt(newest)}` |" if newest else "| Newest stable release | none |",
+              f"| Missing versions (newer than current) | {len(missing)} |",
+              f"| Bumping to (oldest gap) | `{fmt(next_key)}` |" if next_key else "| Bumping to | nothing to do |",
+              "",
+          ]
+          if missing_keys:
+              lines += ["Gap list, oldest → newest: " + ", ".join(f"`{fmt(v)}`" for v in missing_keys), ""]
+              if len(missing_keys) > 1:
+                  lines += [
+                      f"Serial catch-up: {len(missing_keys) - 1} more version(s) remain after this one. "
+                      "The next daily run will pick up the next gap once this PR is merged.",
+                      "",
+                  ]
+          if not cur_seen:
+              lines += [f"⚠️ Current version `{cur_raw}` is not in the fetched window; the gap list covers only releases in that window.", ""]
+          elif truncated:
+              lines += ["ℹ️ Release list capped at 100 items; all releases newer than the current version are inside the window.", ""]
+          if skipped:
+              preview = ", ".join(skipped[:10]) + (" …" if len(skipped) > 10 else "")
+              lines += [f"Skipped: {preview}", ""]
+          if os.environ.get("DRY_RUN") == "true":
+              lines += ["**Dry run — no files were modified and no PR was opened.**", ""]
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          print("\n".join(lines))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"next={fmt(next_key) if next_key else ''}\n")
+              fh.write(f"tag={stable[next_key] if next_key else ''}\n")
+              fh.write(f"newest={fmt(newest) if newest else ''}\n")
+              fh.write(f"count={len(missing_keys)}\n")
+              fh.write("missing_inline=" + ", ".join(f"`{fmt(v)}`" for v in missing_keys) + "\n")
+              fh.write("remaining_inline=" + ", ".join(f"`{fmt(v)}`" for v in missing_keys[1:]) + "\n")
           PY
 
-      - name: Verify the upstream image tag is published
-        if: steps.latest.outputs.newer == 'true'
+      - name: Check for an already-open bump PR
+        id: pr
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false'
         env:
-          VERSION: ${{ steps.latest.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: bump/upstream-${{ steps.gaps.outputs.next }}
+        run: |
+          # An open PR for this exact version means the bump is already waiting
+          # for review, so re-running must be a no-op.
+          n=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$n" -gt 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Open PR already exists for $BRANCH; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the upstream image tag is published
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false'
+        env:
+          VERSION: ${{ steps.gaps.outputs.next }}
         run: |
           # A release can be tagged a little before its image finishes pushing.
           # Retry before giving up, so a normal race self-heals silently while a
@@ -115,9 +255,9 @@ jobs:
           exit 1
 
       - name: Bump UPSTREAM_VERSION and the Dockerfile arg default
-        if: steps.latest.outputs.newer == 'true'
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false' && steps.pr.outputs.exists == 'false'
         env:
-          VERSION: ${{ steps.latest.outputs.version }}
+          VERSION: ${{ steps.gaps.outputs.next }}
         run: |
           printf '%s\n' "$VERSION" > UPSTREAM_VERSION
           sed -i "s|^ARG OPEN_TERMINAL_VERSION=.*|ARG OPEN_TERMINAL_VERSION=${VERSION}|" Dockerfile
@@ -125,22 +265,25 @@ jobs:
           grep -qx "ARG OPEN_TERMINAL_VERSION=${VERSION}" Dockerfile
 
       - name: Open pull request
-        if: steps.latest.outputs.newer == 'true'
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false' && steps.pr.outputs.exists == 'false'
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: |
-            chore(deps): bump upstream open-terminal to ${{ steps.latest.outputs.version }}
-          branch: bump/upstream-${{ steps.latest.outputs.version }}
+            chore(deps): bump upstream open-terminal to ${{ steps.gaps.outputs.next }}
+          branch: bump/upstream-${{ steps.gaps.outputs.next }}
           title: |
-            chore(deps): bump upstream open-terminal to ${{ steps.latest.outputs.version }}
+            chore(deps): bump upstream open-terminal to ${{ steps.gaps.outputs.next }}
           body: |
-            Upstream Open Terminal released a new stable version.
+            Upstream Open Terminal has stable releases newer than the tracked version.
 
             - Current: `${{ steps.current.outputs.version }}`
-            - Latest:  `${{ steps.latest.outputs.version }}`
-            - Release notes: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.latest.outputs.release_tag }}
-            - Also released since then: `${{ steps.latest.outputs.skipped || 'none' }}` (superseded by the version above, not built separately)
+            - Bumping to (oldest gap): `${{ steps.gaps.outputs.next }}`
+            - Newest stable: `${{ steps.gaps.outputs.newest }}`
+            - All missing versions: ${{ steps.gaps.outputs.missing_inline }}
+            - Release notes: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.gaps.outputs.tag }}
 
-            Merging this PR will trigger `ci-build.yml`, which builds and publishes the image tagged with this version (and moves `latest`).
+            Merging this PR triggers `ci-build.yml`, which builds and publishes `${{ steps.gaps.outputs.next }}` and moves `latest` to it.
+
+            Version bumps are applied one at a time because they all edit the same `UPSTREAM_VERSION`, and `latest` must only move forward. Remaining gaps after this merge: ${{ steps.gaps.outputs.remaining_inline || 'none' }} — the next daily run opens the next PR.
           labels: dependencies
           delete-branch: true
