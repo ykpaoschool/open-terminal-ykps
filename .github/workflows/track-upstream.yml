@@ -29,33 +29,28 @@ jobs:
         id: current
         run: echo "version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch latest upstream release
+      - name: Resolve newest upstream stable release
         id: latest
-        run: |
-          # /releases/latest excludes drafts and prereleases.
-          tag=$(curl -fsSL \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
-            | jq -r .tag_name)
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-            echo "Failed to fetch latest upstream release" >&2
-            exit 1
-          fi
-          # Upstream release tags carry a leading "v" (v0.13.0) but its image
-          # tags do not (0.13.0). UPSTREAM_VERSION stores the image tag form so
-          # it drops straight into the Dockerfile FROM line.
-          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Compare versions
-        id: cmp
         env:
           CURRENT: ${{ steps.current.outputs.version }}
-          LATEST: ${{ steps.latest.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # /releases/latest only ever returns a single release, so when upstream
+          # ships twice between two polls (v0.14.3 and v0.14.4 came out eleven
+          # minutes apart) the earlier one is never seen. Read the whole list
+          # instead and pick the highest stable version, so a skipped release at
+          # least shows up in the logs and in the PR body.
+          #
+          # Picking the highest version - rather than the most recently published
+          # release - also keeps a late backport (e.g. v0.13.1 published after
+          # v0.14.7) from masking the fact that we are already further ahead.
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100" \
+            -o /tmp/releases.json
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import os
+          import json, os, sys
 
           def tup(v):
               out = []
@@ -68,13 +63,33 @@ jobs:
                   out.append(int(digits) if digits else 0)
               return tuple(out)
 
+          with open("/tmp/releases.json") as fh:
+              releases = json.load(fh)
+          if not isinstance(releases, list):
+              sys.exit("Unexpected GitHub API response while listing releases")
+
+          # Drafts and prereleases are excluded, as /releases/latest did before.
+          by_version = {}
+          for rel in releases:
+              if rel.get("draft") or rel.get("prerelease"):
+                  continue
+              by_version.setdefault(tup(rel["tag_name"]), rel["tag_name"])
+
           current = tup(os.environ["CURRENT"])
-          latest = tup(os.environ["LATEST"])
-          print(f"newer={'true' if latest > current else 'false'}")
+          newer = sorted(v for v in by_version if v > current)
+          print(f"newer={'true' if newer else 'false'}")
+          if newer:
+              # Upstream release tags carry a leading "v" (v0.13.0) but its image
+              # tags do not (0.13.0). UPSTREAM_VERSION stores the image tag form
+              # so it drops straight into the Dockerfile FROM line.
+              tag = by_version[newer[-1]]
+              print(f"release_tag={tag}")
+              print(f"version={tag.lstrip('v')}")
+          print("skipped=" + ",".join(by_version[v] for v in newer[:-1]))
           PY
 
       - name: Verify the upstream image tag is published
-        if: steps.cmp.outputs.newer == 'true'
+        if: steps.latest.outputs.newer == 'true'
         env:
           VERSION: ${{ steps.latest.outputs.version }}
         run: |
@@ -100,7 +115,7 @@ jobs:
           exit 1
 
       - name: Bump UPSTREAM_VERSION and the Dockerfile arg default
-        if: steps.cmp.outputs.newer == 'true'
+        if: steps.latest.outputs.newer == 'true'
         env:
           VERSION: ${{ steps.latest.outputs.version }}
         run: |
@@ -110,7 +125,7 @@ jobs:
           grep -qx "ARG OPEN_TERMINAL_VERSION=${VERSION}" Dockerfile
 
       - name: Open pull request
-        if: steps.cmp.outputs.newer == 'true'
+        if: steps.latest.outputs.newer == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: |
@@ -124,6 +139,7 @@ jobs:
             - Current: `${{ steps.current.outputs.version }}`
             - Latest:  `${{ steps.latest.outputs.version }}`
             - Release notes: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.latest.outputs.release_tag }}
+            - Also released since then: `${{ steps.latest.outputs.skipped || 'none' }}` (superseded by the version above, not built separately)
 
             Merging this PR will trigger `ci-build.yml`, which builds and publishes the image tagged with this version (and moves `latest`).
           labels: dependencies
