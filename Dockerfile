@@ -32,4 +32,24 @@ RUN pip install --no-cache-dir \
 RUN npm install -g \
     pptxgenjs
 
+# Node resolves bare specifiers by walking from the importing file up to the
+# filesystem root looking for `node_modules`, but `npm install -g` puts packages
+# outside that chain. Linking the global root at `/` makes it part of every walk,
+# so globals resolve from any cwd, as any user, for both module systems.
+#
+# Do not replace this with `ENV NODE_PATH=$(npm root -g)`:
+#   - ESM (`import`) ignores NODE_PATH entirely (only `require()` honours it),
+#   - sudo strips NODE_PATH via env_reset, which breaks multi-user mode where
+#     commands run through `sudo -u`.
+# The target is resolved at build time so a base-image Node layout change
+# (/usr/lib -> /usr/local/lib, etc.) cannot silently break resolution.
+RUN test ! -e /node_modules \
+ && ln -s "$(npm root -g)" /node_modules
+
+# Fail the build if a pre-installed global package is not importable. Keep this
+# list in sync with the packages above; scripts/smoke-test.sh repeats it against
+# the published image in CI.
+RUN node -e "require('pptxgenjs')" \
+ && node --input-type=module -e "import 'pptxgenjs'"
+
 USER user

@@ -58,6 +58,17 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,scope=${{ matrix.platform }},mode=max
 
+      # Checks the image's actual contract (binaries, python deps, npm globals)
+      # against the digest just pushed, on this platform. Failing here fails the
+      # job, so `merge` never runs and the broken build cannot become `latest`;
+      # the pushed digest stays untagged.
+      - name: Smoke test published image
+        run: |
+          docker run --rm --entrypoint sh \
+            -v "$PWD/scripts/smoke-test.sh:/smoke-test.sh:ro" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" \
+            /smoke-test.sh
+
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
