@@ -65,6 +65,18 @@ RUN npm install -g \
 
 Rebuild after changes: `docker compose build`
 
+Global npm packages are importable from any working directory, with both `require()` and `import`.
+
+Verify a built image (binaries, python deps, npm imports):
+
+```bash
+docker run --rm --entrypoint sh \
+  -v "$PWD/scripts:/scripts:ro" open-terminal-ykps /scripts/smoke-test.sh
+```
+
+CI runs the same script against each published platform before assembling the
+version's manifest.
+
 ## Building a Different Base Version
 
 The base version comes from `UPSTREAM_VERSION` via the Dockerfile's `OPEN_TERMINAL_VERSION` arg. To build something else locally (e.g. an older version for rollback testing):
