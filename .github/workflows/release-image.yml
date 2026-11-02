@@ -73,3 +73,12 @@ jobs:
             OPEN_TERMINAL_VERSION=${{ steps.ver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # The image is already pushed at this point; this reports a broken build
+      # rather than preventing it (unlike ci-build.yml, which gates the manifest).
+      - name: Smoke test published image
+        run: |
+          docker run --rm --entrypoint sh \
+            -v "$PWD/scripts/smoke-test.sh:/smoke-test.sh:ro" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}" \
+            /smoke-test.sh
