@@ -62,9 +62,14 @@ jobs:
       # against the digest just pushed, on this platform. Failing here fails the
       # job, so `merge` never runs and the broken build cannot become `latest`;
       # the pushed digest stays untagged.
+      #
+      # --platform is required: the digest is a single-platform image, and
+      # without it `docker run` asks for the runner's own architecture and the
+      # pull fails with "no matching manifest" (arm64 job on an amd64 runner).
+      # The arm64 job runs under the QEMU binfmt registered above.
       - name: Smoke test published image
         run: |
-          docker run --rm --entrypoint sh \
+          docker run --rm --platform "${{ matrix.platform }}" --entrypoint sh \
             -v "$PWD/scripts/smoke-test.sh:/smoke-test.sh:ro" \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" \
             /smoke-test.sh
