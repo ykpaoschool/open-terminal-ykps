@@ -4,6 +4,12 @@ name: CI Build and Publish
 # Both dependency changes and upstream version bumps (from track-upstream.yml)
 # land here: a dependency change rebuilds the *current* pinned version, an
 # upstream bump advances it.
+#
+# When this workflow finishes successfully, its completion fires track-upstream.yml
+# (via `workflow_run` on that side), which checks for the next untracked upstream
+# version. There is deliberately no trigger step in this file: a problem with the
+# upstream check must never fail an otherwise good build, and the build should not
+# have to know that upstream tracking exists.
 
 on:
   push:

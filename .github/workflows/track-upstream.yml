@@ -2,7 +2,16 @@ name: Track Upstream Open Terminal
 
 # Polls open-webui/open-terminal for new stable releases and opens a PR bumping
 # UPSTREAM_VERSION. Merging that PR triggers ci-build.yml, which publishes the
-# image tagged with the new version.
+# image tagged with the new version; when that build finishes successfully it
+# fires this workflow again, so the next untracked version is picked up right
+# away instead of waiting for the daily schedule.
+#
+# Why workflow_run in ci-build.yml's direction and not `gh workflow run` from a
+# ci-build step:
+#   The build should not have to know that upstream tracking exists, and a
+#   problem triggering the check must not fail an otherwise good image build.
+#   The workflow_run trigger keeps the two workflows decoupled while the
+#   `track-upstream` concurrency group still serializes overlapping runs.
 #
 # Why this workflow lists releases instead of asking for `releases/latest`:
 #   Upstream can publish more than one stable release between two daily polls.
@@ -15,9 +24,9 @@ name: Track Upstream Open Terminal
 # Why one version per run (serial catch-up) and not one PR per gap:
 #   Every bump edits the same single-line `UPSTREAM_VERSION` and the same
 #   Dockerfile line, so parallel bump PRs conflict with each other and the later
-#   ones go stale. Bumping the oldest gap first, then letting the next daily run
-#   find the next gap, keeps exactly one open PR at a time and moves `latest`
-#   strictly forward.
+#   ones go stale. Bumping the oldest gap first, then re-checking after each
+#   successful build (the daily schedule is a backstop), keeps exactly one open
+#   PR at a time and moves `latest` strictly forward.
 #
 # Do NOT "fix" a gap by pointing UPSTREAM_VERSION at an older tag:
 #   `latest` is written only by ci-build.yml from UPSTREAM_VERSION, so moving it
@@ -26,8 +35,15 @@ name: Track Upstream Open Terminal
 
 on:
   schedule:
-    # Daily at 06:17 UTC (off-peak minute)
+    # Daily at 06:17 UTC (off-peak minute). This is now a backstop: every
+    # successful image build also triggers a check below.
     - cron: '17 6 * * *'
+  # Re-check as soon as a build finishes, so a version gap is acted on right
+  # after the previous version is published instead of on the next daily poll.
+  workflow_run:
+    workflows: ['CI Build and Publish']
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -53,6 +69,11 @@ concurrency:
 jobs:
   check-and-bump:
     runs-on: ubuntu-latest
+    # Only act when the build that triggered us succeeded. A failed build means
+    # the pinned version's image was never published, so advancing the baseline
+    # past it would skip a version nobody can pull. Schedule/dispatch runs carry
+    # no workflow_run conclusion and are never gated.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
 
     steps:
       - name: Checkout
@@ -65,9 +86,10 @@ jobs:
           DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
           SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
         run: |
-          # Scheduled runs always act for real; manual dispatches default to dry run.
+          # Scheduled and build-completion runs always act for real; manual
+          # dispatches default to dry run.
           dry="true"
-          if [ "$EVENT_NAME" = "schedule" ] || [ "$DRY_RUN_INPUT" = "false" ]; then
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_run" ] || [ "$DRY_RUN_INPUT" = "false" ]; then
             dry="false"
           fi
           if [ -n "$SIMULATE_INPUT" ] && [ "$dry" != "true" ]; then
@@ -112,6 +134,7 @@ jobs:
           RELEASES_JSON: ${{ runner.temp }}/releases.json
           DRY_RUN: ${{ steps.mode.outputs.dry_run }}
           SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
+          TRIGGER: ${{ github.event_name }}
         run: |
           python3 - <<'PY'
           import json, os, re, sys
@@ -165,11 +188,17 @@ jobs:
           cur_seen = cur in stable
           truncated = len(releases) >= 100
 
+          trigger = {
+              "schedule": "daily schedule",
+              "workflow_run": "image build completed",
+          }.get(os.environ.get("TRIGGER", ""), "manual dispatch")
+
           lines = [
               "### Upstream release check",
               "",
               "| | |",
               "|---|---|",
+              f"| Trigger | {trigger} |",
               f"| Current `UPSTREAM_VERSION` | `{cur_raw}`{' (simulated)' if os.environ.get('SIMULATE_INPUT') else ''} |",
               f"| Stable releases in window | {len(stable)} |",
               f"| Newest stable release | `{fmt(newest)}` |" if newest else "| Newest stable release | none |",
@@ -182,7 +211,8 @@ jobs:
               if len(missing_keys) > 1:
                   lines += [
                       f"Serial catch-up: {len(missing_keys) - 1} more version(s) remain after this one. "
-                      "The next daily run will pick up the next gap once this PR is merged.",
+                      "Once this PR is merged and its image build succeeds, this workflow re-runs "
+                      "automatically and opens the next gap.",
                       "",
                   ]
           if not cur_seen:
@@ -284,6 +314,6 @@ jobs:
 
             Merging this PR triggers `ci-build.yml`, which builds and publishes `${{ steps.gaps.outputs.next }}` and moves `latest` to it.
 
-            Version bumps are applied one at a time because they all edit the same `UPSTREAM_VERSION`, and `latest` must only move forward. Remaining gaps after this merge: ${{ steps.gaps.outputs.remaining_inline || 'none' }} — the next daily run opens the next PR.
+            Version bumps are applied one at a time because they all edit the same `UPSTREAM_VERSION`, and `latest` must only move forward. Remaining gaps after this merge: ${{ steps.gaps.outputs.remaining_inline || 'none' }} — when the resulting image build succeeds, `ci-build.yml` re-runs this workflow and the next PR opens automatically; the daily schedule is only a backstop.
           labels: dependencies
           delete-branch: true

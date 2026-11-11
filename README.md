@@ -29,7 +29,7 @@ This image tracks upstream Open Terminal stable releases. The tracked version li
 
 ## How upgrades work
 
-- A daily workflow polls upstream for new stable releases and opens a PR bumping `UPSTREAM_VERSION` (and the Dockerfile's arg default).
+- A workflow polls upstream for new stable releases and opens a PR bumping `UPSTREAM_VERSION` (and the Dockerfile's arg default). It runs daily and again automatically each time an image build finishes, so the next untracked version is picked up right after the previous one is published.
 - If several stable releases appeared since the last poll, it opens the oldest untracked one first; the remaining ones follow on subsequent runs, so no version is skipped. Only one bump PR is open at a time.
 - Merging that PR triggers CI, which builds and publishes the new version (and moves `latest`).
 - Dependency changes rebuild the *current* tracked version in place — they don't advance the Open Terminal baseline.
@@ -40,7 +40,7 @@ To see what is pending without changing anything:
 gh workflow run track-upstream.yml -f dry_run=true
 ```
 
-The run summary lists the pinned version, the stable releases found upstream, and the full list of untracked versions. Manual dispatches default to `dry_run=true`; the scheduled run always applies the bump.
+The run summary lists the pinned version, the stable releases found upstream, and the full list of untracked versions. Manual dispatches default to `dry_run=true`; scheduled and build-triggered runs always apply the bump.
 
 See [CLAUDE.md](CLAUDE.md) for the full workflow details.
 
